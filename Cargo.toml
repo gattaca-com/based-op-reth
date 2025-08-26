@@ -454,6 +454,22 @@ op-revm = { version = "3.0.2", default-features = false }
 revm-inspectors = "0.19.0"
 
 # eth
+# <<<<<<< HEAD
+# alloy-chains = { version = "0.1.68", default-features = false }
+# alloy-dyn-abi = "0.8.25"
+# alloy-eip2124 = { version = "0.1.0", default-features = false }
+
+# # alloy-primitives = { version = "0.8.15", default-features = false, features = [
+# #     "map-foldhash",
+# # ] }
+# # alloy-rlp = { version = "0.3.10", default-features = false }
+# # alloy-sol-types = "=0.8.22"
+# # alloy-trie = { version = "0.7", default-features = false }
+
+# alloy-evm = { version = "0.3.1", default-features = false }
+# alloy-primitives = { version = "0.8.25", default-features = false, features = ["map-foldhash"] }
+# =======
+
 alloy-chains = { version = "0.2.0", default-features = false }
 alloy-dyn-abi = "1.0.0"
 alloy-eip2124 = { version = "0.2.0", default-features = false }

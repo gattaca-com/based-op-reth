@@ -96,6 +96,32 @@ impl OpTransactionSigned {
         matches!(self.transaction, OpTypedTransaction::Deposit(_))
     }
 
+    /// Warning: the signature for a deposit transaction is always zero
+    pub fn from_envelope(envelope: OpTxEnvelope) -> Self {
+        let (t, signature, hash) = match envelope {
+            OpTxEnvelope::Legacy(tx) => {
+                let (t, signature, hash) = tx.into_parts();
+                (OpTypedTransaction::Legacy(t), signature, hash)
+            }
+            OpTxEnvelope::Eip2930(tx) => {
+                let (t, signature, hash) = tx.into_parts();
+                (OpTypedTransaction::Eip2930(t), signature, hash)
+            }
+            OpTxEnvelope::Eip1559(tx) => {
+                let (t, signature, hash) = tx.into_parts();
+                (OpTypedTransaction::Eip1559(t), signature, hash)
+            }
+            OpTxEnvelope::Eip7702(tx) => {
+                let (t, signature, hash) = tx.into_parts();
+                (OpTypedTransaction::Eip7702(t), signature, hash)
+            }
+            OpTxEnvelope::Deposit(_) => {
+                (envelope.into(), Signature::new(U256::ZERO, U256::ZERO, false), B256::ZERO)
+            }
+            _ => unreachable!(),
+        };
+        Self::new(t, signature, hash)
+    }
     /// Splits the transaction into parts.
     pub fn into_parts(self) -> (OpTypedTransaction, Signature, B256) {
         let hash = *self.hash.get_or_init(|| self.recalculate_hash());
@@ -112,7 +138,7 @@ impl SignedTransaction for OpTransactionSigned {
         // Optimism's Deposit transaction does not have a signature. Directly return the
         // `from` address.
         if let OpTypedTransaction::Deposit(TxDeposit { from, .. }) = self.transaction {
-            return Ok(from)
+            return Ok(from);
         }
 
         let Self { transaction, signature, .. } = self;
@@ -124,7 +150,7 @@ impl SignedTransaction for OpTransactionSigned {
         // Optimism's Deposit transaction does not have a signature. Directly return the
         // `from` address.
         if let OpTypedTransaction::Deposit(TxDeposit { from, .. }) = &self.transaction {
-            return Ok(*from)
+            return Ok(*from);
         }
 
         let Self { transaction, signature, .. } = self;
