@@ -22,6 +22,7 @@ use reth_storage_errors::provider::ProviderResult;
 pub struct ConsistentDbView<Factory> {
     factory: Factory,
     tip: Option<(B256, u64)>,
+    ignore_tip_check: bool,
 }
 
 impl<Factory> ConsistentDbView<Factory>
@@ -30,7 +31,7 @@ where
 {
     /// Creates new consistent database view.
     pub const fn new(factory: Factory, tip: Option<(B256, u64)>) -> Self {
-        Self { factory, tip }
+        Self { factory, tip, ignore_tip_check: false }
     }
 
     /// Creates new consistent database view with latest tip.
@@ -46,6 +47,9 @@ where
         // Create a new provider.
         let provider_ro = self.factory.database_provider_ro()?;
 
+        if self.ignore_tip_check {
+            return Ok(provider_ro);
+        }
         // Check that the currently stored tip is included on-disk.
         // This means that the database may have moved, but the view was not reorged.
         //

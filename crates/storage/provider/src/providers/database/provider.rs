@@ -677,7 +677,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
     /// Populate a [`BundleStateInit`] and [`RevertsInit`] using cursors over the
     /// [`PlainAccountState`] and [`PlainStorageState`] tables, based on the given storage and
     /// account changesets.
-    fn populate_bundle_state<A, S>(
+    pub fn populate_bundle_state<A, S>(
         &self,
         account_changeset: Vec<(u64, AccountBeforeTx)>,
         storage_changeset: Vec<(BlockNumberAddress, StorageEntry)>,
