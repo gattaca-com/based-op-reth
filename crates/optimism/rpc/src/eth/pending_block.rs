@@ -45,6 +45,15 @@ where
         )>,
         Self::Error,
     > {
+        if let Some(rx) = self.inner.flashblocks_rx.as_ref() {
+            if let Some(block) = rx.borrow().as_ref() {
+                return Ok(Some((
+                    block.recovered_block.clone(),
+                    Arc::new(block.execution_output.receipts.iter().flatten().cloned().collect()),
+                )))
+            }
+        }
+
         // See: <https://github.com/ethereum-optimism/op-geth/blob/f2e69450c6eec9c35d56af91389a1c47737206ca/miner/worker.go#L367-L375>
         let latest = self
             .provider()
