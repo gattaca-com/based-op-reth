@@ -11,16 +11,18 @@ use crate::{
     },
     AccountReader, BlockBodyWriter, BlockExecutionWriter, BlockHashReader, BlockNumReader,
     BlockReader, BlockWriter, BundleStateInit, ChainStateBlockReader, ChainStateBlockWriter,
-    DBProvider, HashingWriter, HeaderProvider, HeaderSyncGap, HeaderSyncGapProvider,
-    HistoricalStateProvider, HistoricalStateProviderRef, HistoryWriter, LatestStateProvider,
-    LatestStateProviderRef, OriginalValuesKnown, ProviderError, PruneCheckpointReader,
-    PruneCheckpointWriter, RevertsInit, StageCheckpointReader, StateCommitmentProvider,
-    StateProviderBox, StateWriter, StaticFileProviderFactory, StatsReader, StorageLocation,
-    StorageReader, StorageTrieWriter, TransactionVariant, TransactionsProvider,
-    TransactionsProviderExt, TrieWriter, WithdrawalsProvider,
+    DBProvider, HashingWriter, HeaderProvider, HeaderSyncGapProvider, HistoricalStateProvider,
+    HistoricalStateProviderRef, HistoryWriter, LatestStateProvider, LatestStateProviderRef,
+    OriginalValuesKnown, ProviderError, PruneCheckpointReader, PruneCheckpointWriter, RevertsInit,
+    StageCheckpointReader, StateProviderBox, StateWriter, StaticFileProviderFactory, StatsReader,
+    StorageLocation, StorageReader, StorageTrieWriter, TransactionVariant, TransactionsProvider,
+    TransactionsProviderExt, TrieWriter,
 };
-use alloy_consensus::{transaction::TransactionMeta, BlockHeader, Header, TxReceipt};
-use alloy_eips::{eip2718::Encodable2718, eip4895::Withdrawals, BlockHashOrNumber};
+use alloy_consensus::{
+    transaction::{SignerRecoverable, TransactionMeta, TxHashRef},
+    BlockHeader, Header, TxReceipt,
+};
+use alloy_eips::{eip2718::Encodable2718, BlockHashOrNumber};
 use alloy_primitives::{
     keccak256,
     map::{hash_map, B256Map, HashMap, HashSet},
@@ -42,11 +44,10 @@ use reth_db_api::{
     BlockNumberList, DatabaseError, PlainAccountState, PlainStorageState,
 };
 use reth_execution_types::{Chain, ExecutionOutcome};
-use reth_network_p2p::headers::downloader::SyncTarget;
 use reth_node_types::{BlockTy, BodyTy, HeaderTy, NodeTypes, ReceiptTy, TxTy};
 use reth_primitives_traits::{
     Account, Block as _, BlockBody as _, Bytecode, GotExpected, NodePrimitives, RecoveredBlock,
-    SealedBlock, SealedHeader, SignedTransaction, StorageEntry,
+    SealedHeader, StorageEntry,
 };
 use reth_prune_types::{
     PruneCheckpoint, PruneMode, PruneModes, PruneSegment, MINIMUM_PRUNING_DISTANCE,
@@ -54,8 +55,8 @@ use reth_prune_types::{
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
-    BlockBodyIndicesProvider, BlockBodyReader, NodePrimitivesProvider, OmmersProvider,
-    StateProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider,
+    BlockBodyIndicesProvider, BlockBodyReader, NodePrimitivesProvider, StateProvider,
+    StorageChangeSetReader, TryIntoHistoricalStateProvider,
 };
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
 use reth_trie::{
@@ -74,7 +75,6 @@ use std::{
     ops::{Deref, DerefMut, Range, RangeBounds, RangeInclusive},
     sync::{mpsc, Arc},
 };
-use tokio::sync::watch;
 use tracing::{debug, trace};
 
 /// A [`DatabaseProvider`] that holds a read-only database transaction.
@@ -410,10 +410,6 @@ impl<TX: DbTx + 'static, N: NodeTypes> TryIntoHistoricalStateProvider for Databa
     }
 }
 
-impl<TX: DbTx + 'static, N: NodeTypes> StateCommitmentProvider for DatabaseProvider<TX, N> {
-    type StateCommitment = N::StateCommitment;
-}
-
 impl<
         Tx: DbTx + DbTxMut + 'static,
         N: NodeTypesForProvider<Primitives: NodePrimitives<BlockHeader = Header>>,
@@ -452,18 +448,20 @@ impl<
     }
 }
 
-/// For a given key, unwind all history shards that are below the given block number.
+/// For a given key, unwind all history shards that contain block numbers at or above the given
+/// block number.
 ///
 /// S - Sharded key subtype.
 /// T - Table to walk over.
 /// C - Cursor implementation.
 ///
 /// This function walks the entries from the given start key and deletes all shards that belong to
-/// the key and are below the given block number.
+/// the key and contain block numbers at or above the given block number. Shards entirely below
+/// the block number are preserved.
 ///
-/// The boundary shard (the shard is split by the block number) is removed from the database. Any
-/// indices that are above the block number are filtered out. The boundary shard is returned for
-/// reinsertion (if it's not empty).
+/// The boundary shard (the shard that spans across the block number) is removed from the database.
+/// Any indices that are below the block number are filtered out and returned for reinsertion.
+/// The boundary shard is returned for reinsertion (if it's not empty).
 fn unwind_history_shards<S, T, C>(
     cursor: &mut C,
     start_key: T::Key,
@@ -475,27 +473,41 @@ where
     T::Key: AsRef<ShardedKey<S>>,
     C: DbCursorRO<T> + DbCursorRW<T>,
 {
+    // Start from the given key and iterate through shards
     let mut item = cursor.seek_exact(start_key)?;
     while let Some((sharded_key, list)) = item {
         // If the shard does not belong to the key, break.
         if !shard_belongs_to_key(&sharded_key) {
             break
         }
+
+        // Always delete the current shard from the database first
+        // We'll decide later what (if anything) to reinsert
         cursor.delete_current()?;
 
-        // Check the first item.
-        // If it is greater or eq to the block number, delete it.
+        // Get the first (lowest) block number in this shard
+        // All block numbers in a shard are sorted in ascending order
         let first = list.iter().next().expect("List can't be empty");
+
+        // Case 1: Entire shard is at or above the unwinding point
+        // Keep it deleted (don't return anything for reinsertion)
         if first >= block_number {
             item = cursor.prev()?;
             continue
-        } else if block_number <= sharded_key.as_ref().highest_block_number {
-            // Filter out all elements greater than block number.
+        }
+        // Case 2: This is a boundary shard (spans across the unwinding point)
+        // The shard contains some blocks below and some at/above the unwinding point
+        else if block_number <= sharded_key.as_ref().highest_block_number {
+            // Return only the block numbers that are below the unwinding point
+            // These will be reinserted to preserve the historical data
             return Ok(list.iter().take_while(|i| *i < block_number).collect::<Vec<_>>())
         }
+        // Case 3: Entire shard is below the unwinding point
+        // Return all block numbers for reinsertion (preserve entire shard)
         return Ok(list.iter().collect::<Vec<_>>())
     }
 
+    // No shards found or all processed
     Ok(Vec::new())
 }
 
@@ -939,11 +951,10 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> HeaderSyncGapProvider
 {
     type Header = HeaderTy<N>;
 
-    fn sync_gap(
+    fn local_tip_header(
         &self,
-        tip: watch::Receiver<B256>,
         highest_uninterrupted_block: BlockNumber,
-    ) -> ProviderResult<HeaderSyncGap<Self::Header>> {
+    ) -> ProviderResult<SealedHeader<Self::Header>> {
         let static_file_provider = self.static_file_provider();
 
         // Make sure Headers static file is at the same height. If it's further, this
@@ -976,9 +987,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> HeaderSyncGapProvider
             .sealed_header(highest_uninterrupted_block)?
             .ok_or_else(|| ProviderError::HeaderNotFound(highest_uninterrupted_block.into()))?;
 
-        let target = SyncTarget::Tip(*tip.borrow());
-
-        Ok(HeaderSyncGap { local_head, target })
+        Ok(local_head)
     }
 }
 
@@ -1011,12 +1020,12 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> HeaderProvider for DatabasePro
     }
 
     fn header_td_by_number(&self, number: BlockNumber) -> ProviderResult<Option<U256>> {
-        if self.chain_spec.is_paris_active_at_block(number) {
-            if let Some(td) = self.chain_spec.final_paris_total_difficulty() {
-                // if this block is higher than the final paris(merge) block, return the final paris
-                // difficulty
-                return Ok(Some(td))
-            }
+        if self.chain_spec.is_paris_active_at_block(number) &&
+            let Some(td) = self.chain_spec.final_paris_total_difficulty()
+        {
+            // if this block is higher than the final paris(merge) block, return the final paris
+            // difficulty
+            return Ok(Some(td))
         }
 
         self.static_file_provider.get_with_static_file_or_database(
@@ -1171,41 +1180,36 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
     /// If the header is found, but the transactions either do not exist, or are not indexed, this
     /// will return None.
     fn block(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Self::Block>> {
-        if let Some(number) = self.convert_hash_or_number(id)? {
-            if let Some(header) = self.header_by_number(number)? {
-                // If the body indices are not found, this means that the transactions either do not
-                // exist in the database yet, or they do exit but are not indexed.
-                // If they exist but are not indexed, we don't have enough
-                // information to return the block anyways, so we return `None`.
-                let Some(transactions) = self.transactions_by_block(number.into())? else {
-                    return Ok(None)
-                };
+        if let Some(number) = self.convert_hash_or_number(id)? &&
+            let Some(header) = self.header_by_number(number)?
+        {
+            // If the body indices are not found, this means that the transactions either do not
+            // exist in the database yet, or they do exit but are not indexed.
+            // If they exist but are not indexed, we don't have enough
+            // information to return the block anyways, so we return `None`.
+            let Some(transactions) = self.transactions_by_block(number.into())? else {
+                return Ok(None)
+            };
 
-                let body = self
-                    .storage
-                    .reader()
-                    .read_block_bodies(self, vec![(&header, transactions)])?
-                    .pop()
-                    .ok_or(ProviderError::InvalidStorageOutput)?;
+            let body = self
+                .storage
+                .reader()
+                .read_block_bodies(self, vec![(&header, transactions)])?
+                .pop()
+                .ok_or(ProviderError::InvalidStorageOutput)?;
 
-                return Ok(Some(Self::Block::new(header, body)))
-            }
+            return Ok(Some(Self::Block::new(header, body)))
         }
 
         Ok(None)
     }
-
-    fn pending_block(&self) -> ProviderResult<Option<SealedBlock<Self::Block>>> {
-        Ok(None)
-    }
-
-    fn pending_block_with_senders(&self) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
+    fn pending_block(&self) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
         Ok(None)
     }
 
     fn pending_block_and_receipts(
         &self,
-    ) -> ProviderResult<Option<(SealedBlock<Self::Block>, Vec<Self::Receipt>)>> {
+    ) -> ProviderResult<Option<(RecoveredBlock<Self::Block>, Vec<Self::Receipt>)>> {
         Ok(None)
     }
 
@@ -1412,34 +1416,31 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         tx_hash: TxHash,
     ) -> ProviderResult<Option<(Self::Transaction, TransactionMeta)>> {
         let mut transaction_cursor = self.tx.cursor_read::<tables::TransactionBlocks>()?;
-        if let Some(transaction_id) = self.transaction_id(tx_hash)? {
-            if let Some(transaction) = self.transaction_by_id_unhashed(transaction_id)? {
-                if let Some(block_number) =
-                    transaction_cursor.seek(transaction_id).map(|b| b.map(|(_, bn)| bn))?
-                {
-                    if let Some(sealed_header) = self.sealed_header(block_number)? {
-                        let (header, block_hash) = sealed_header.split();
-                        if let Some(block_body) = self.block_body_indices(block_number)? {
-                            // the index of the tx in the block is the offset:
-                            // len([start..tx_id])
-                            // NOTE: `transaction_id` is always `>=` the block's first
-                            // index
-                            let index = transaction_id - block_body.first_tx_num();
+        if let Some(transaction_id) = self.transaction_id(tx_hash)? &&
+            let Some(transaction) = self.transaction_by_id_unhashed(transaction_id)? &&
+            let Some(block_number) =
+                transaction_cursor.seek(transaction_id).map(|b| b.map(|(_, bn)| bn))? &&
+            let Some(sealed_header) = self.sealed_header(block_number)?
+        {
+            let (header, block_hash) = sealed_header.split();
+            if let Some(block_body) = self.block_body_indices(block_number)? {
+                // the index of the tx in the block is the offset:
+                // len([start..tx_id])
+                // NOTE: `transaction_id` is always `>=` the block's first
+                // index
+                let index = transaction_id - block_body.first_tx_num();
 
-                            let meta = TransactionMeta {
-                                tx_hash,
-                                index,
-                                block_hash,
-                                block_number,
-                                base_fee: header.base_fee_per_gas(),
-                                excess_blob_gas: header.excess_blob_gas(),
-                                timestamp: header.timestamp(),
-                            };
+                let meta = TransactionMeta {
+                    tx_hash,
+                    index,
+                    block_hash,
+                    block_number,
+                    base_fee: header.base_fee_per_gas(),
+                    excess_blob_gas: header.excess_blob_gas(),
+                    timestamp: header.timestamp(),
+                };
 
-                            return Ok(Some((transaction, meta)))
-                        }
-                    }
-                }
+                return Ok(Some((transaction, meta)))
             }
         }
 
@@ -1457,14 +1458,14 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
     ) -> ProviderResult<Option<Vec<Self::Transaction>>> {
         let mut tx_cursor = self.tx.cursor_read::<tables::Transactions<Self::Transaction>>()?;
 
-        if let Some(block_number) = self.convert_hash_or_number(id)? {
-            if let Some(body) = self.block_body_indices(block_number)? {
-                let tx_range = body.tx_num_range();
-                return if tx_range.is_empty() {
-                    Ok(Some(Vec::new()))
-                } else {
-                    Ok(Some(self.transactions_by_tx_range_with_cursor(tx_range, &mut tx_cursor)?))
-                }
+        if let Some(block_number) = self.convert_hash_or_number(id)? &&
+            let Some(body) = self.block_body_indices(block_number)?
+        {
+            let tx_range = body.tx_num_range();
+            return if tx_range.is_empty() {
+                Ok(Some(Vec::new()))
+            } else {
+                Ok(Some(self.transactions_by_tx_range_with_cursor(tx_range, &mut tx_cursor)?))
             }
         }
         Ok(None)
@@ -1539,14 +1540,14 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> ReceiptProvider for DatabasePr
         &self,
         block: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Receipt>>> {
-        if let Some(number) = self.convert_hash_or_number(block)? {
-            if let Some(body) = self.block_body_indices(number)? {
-                let tx_range = body.tx_num_range();
-                return if tx_range.is_empty() {
-                    Ok(Some(Vec::new()))
-                } else {
-                    self.receipts_by_tx_range(tx_range).map(Some)
-                }
+        if let Some(number) = self.convert_hash_or_number(block)? &&
+            let Some(body) = self.block_body_indices(number)?
+        {
+            let tx_range = body.tx_num_range();
+            return if tx_range.is_empty() {
+                Ok(Some(Vec::new()))
+            } else {
+                self.receipts_by_tx_range(tx_range).map(Some)
             }
         }
         Ok(None)
@@ -1564,61 +1565,60 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> ReceiptProvider for DatabasePr
             |_| true,
         )
     }
-}
 
-impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> WithdrawalsProvider
-    for DatabaseProvider<TX, N>
-{
-    fn withdrawals_by_block(
+    fn receipts_by_block_range(
         &self,
-        id: BlockHashOrNumber,
-        timestamp: u64,
-    ) -> ProviderResult<Option<Withdrawals>> {
-        if self.chain_spec.is_shanghai_active_at_timestamp(timestamp) {
-            if let Some(number) = self.convert_hash_or_number(id)? {
-                return self.static_file_provider.get_with_static_file_or_database(
-                    StaticFileSegment::BlockMeta,
-                    number,
-                    |static_file| static_file.withdrawals_by_block(number.into(), timestamp),
-                    || {
-                        // If we are past shanghai, then all blocks should have a withdrawal list,
-                        // even if empty
-                        let withdrawals = self
-                            .tx
-                            .get::<tables::BlockWithdrawals>(number)
-                            .map(|w| w.map(|w| w.withdrawals))?
-                            .unwrap_or_default();
-                        Ok(Some(withdrawals))
-                    },
-                )
-            }
-        }
-        Ok(None)
-    }
-}
-
-impl<TX: DbTx + 'static, N: NodeTypesForProvider> OmmersProvider for DatabaseProvider<TX, N> {
-    /// Returns the ommers for the block with matching id from the database.
-    ///
-    /// If the block is not found, this returns `None`.
-    /// If the block exists, but doesn't contain ommers, this returns `None`.
-    fn ommers(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Vec<Self::Header>>> {
-        if let Some(number) = self.convert_hash_or_number(id)? {
-            // If the Paris (Merge) hardfork block is known and block is after it, return empty
-            // ommers.
-            if self.chain_spec.is_paris_active_at_block(number) {
-                return Ok(Some(Vec::new()))
-            }
-
-            return self.static_file_provider.get_with_static_file_or_database(
-                StaticFileSegment::BlockMeta,
-                number,
-                |static_file| static_file.ommers(id),
-                || Ok(self.tx.get::<tables::BlockOmmers<Self::Header>>(number)?.map(|o| o.ommers)),
-            )
+        block_range: RangeInclusive<BlockNumber>,
+    ) -> ProviderResult<Vec<Vec<Self::Receipt>>> {
+        if block_range.is_empty() {
+            return Ok(Vec::new());
         }
 
-        Ok(None)
+        // collect block body indices for each block in the range
+        let mut block_body_indices = Vec::new();
+        for block_num in block_range {
+            if let Some(indices) = self.block_body_indices(block_num)? {
+                block_body_indices.push(indices);
+            } else {
+                // use default indices for missing blocks (empty block)
+                block_body_indices.push(StoredBlockBodyIndices::default());
+            }
+        }
+
+        if block_body_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // find blocks with transactions to determine transaction range
+        let non_empty_blocks: Vec<_> =
+            block_body_indices.iter().filter(|indices| indices.tx_count > 0).collect();
+
+        if non_empty_blocks.is_empty() {
+            // all blocks are empty
+            return Ok(vec![Vec::new(); block_body_indices.len()]);
+        }
+
+        // calculate the overall transaction range
+        let first_tx = non_empty_blocks[0].first_tx_num();
+        let last_tx = non_empty_blocks[non_empty_blocks.len() - 1].last_tx_num();
+
+        // fetch all receipts in the transaction range
+        let all_receipts = self.receipts_by_tx_range(first_tx..=last_tx)?;
+        let mut receipts_iter = all_receipts.into_iter();
+
+        // distribute receipts to their respective blocks
+        let mut result = Vec::with_capacity(block_body_indices.len());
+        for indices in &block_body_indices {
+            if indices.tx_count == 0 {
+                result.push(Vec::new());
+            } else {
+                let block_receipts =
+                    receipts_iter.by_ref().take(indices.tx_count as usize).collect();
+                result.push(block_receipts);
+            }
+        }
+
+        Ok(result)
     }
 }
 
@@ -1626,33 +1626,24 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockBodyIndicesProvider
     for DatabaseProvider<TX, N>
 {
     fn block_body_indices(&self, num: u64) -> ProviderResult<Option<StoredBlockBodyIndices>> {
-        self.static_file_provider.get_with_static_file_or_database(
-            StaticFileSegment::BlockMeta,
-            num,
-            |static_file| static_file.block_body_indices(num),
-            || Ok(self.tx.get::<tables::BlockBodyIndices>(num)?),
-        )
+        Ok(self.tx.get::<tables::BlockBodyIndices>(num)?)
     }
 
     fn block_body_indices_range(
         &self,
         range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<StoredBlockBodyIndices>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::BlockMeta,
-            *range.start()..*range.end() + 1,
-            |static_file, range, _| {
-                static_file.block_body_indices_range(range.start..=range.end.saturating_sub(1))
-            },
-            |range, _| self.cursor_read_collect::<tables::BlockBodyIndices>(range),
-            |_| true,
-        )
+        self.cursor_read_collect::<tables::BlockBodyIndices>(range)
     }
 }
 
 impl<TX: DbTx, N: NodeTypes> StageCheckpointReader for DatabaseProvider<TX, N> {
     fn get_stage_checkpoint(&self, id: StageId) -> ProviderResult<Option<StageCheckpoint>> {
-        Ok(self.tx.get::<tables::StageCheckpoints>(id.to_string())?)
+        Ok(if let Some(encoded) = id.get_pre_encoded() {
+            self.tx.get_by_encoded_key::<tables::StageCheckpoints>(encoded)?
+        } else {
+            self.tx.get::<tables::StageCheckpoints>(id.to_string())?
+        })
     }
 
     /// Get stage checkpoint progress.
@@ -2006,10 +1997,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 
             for entry in storage {
                 tracing::trace!(?address, ?entry.key, "Updating plain state storage");
-                if let Some(db_entry) = storages_cursor.seek_by_key_subkey(address, entry.key)? {
-                    if db_entry.key == entry.key {
-                        storages_cursor.delete_current()?;
-                    }
+                if let Some(db_entry) = storages_cursor.seek_by_key_subkey(address, entry.key)? &&
+                    db_entry.key == entry.key
+                {
+                    storages_cursor.delete_current()?;
                 }
 
                 if !entry.value.is_zero() {
@@ -2044,11 +2035,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
             for (hashed_slot, value) in storage.storage_slots_sorted() {
                 let entry = StorageEntry { key: hashed_slot, value };
                 if let Some(db_entry) =
-                    hashed_storage_cursor.seek_by_key_subkey(*hashed_address, entry.key)?
+                    hashed_storage_cursor.seek_by_key_subkey(*hashed_address, entry.key)? &&
+                    db_entry.key == entry.key
                 {
-                    if db_entry.key == entry.key {
-                        hashed_storage_cursor.delete_current()?;
-                    }
+                    hashed_storage_cursor.delete_current()?;
                 }
 
                 if !entry.value.is_zero() {
@@ -2325,7 +2315,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
         let tx = self.tx_ref();
         let mut account_trie_cursor = tx.cursor_write::<tables::AccountsTrie>()?;
         for (key, updated_node) in account_updates {
-            let nibbles = StoredNibbles(key.clone());
+            let nibbles = StoredNibbles(*key);
             match updated_node {
                 Some(node) => {
                     if !nibbles.0.is_empty() {
@@ -2342,7 +2332,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
             }
         }
 
-        num_entries += self.write_storage_trie_updates(trie_updates.storage_tries_ref())?;
+        num_entries += self.write_storage_trie_updates(trie_updates.storage_tries_ref().iter())?;
 
         Ok(num_entries)
     }
@@ -2351,12 +2341,12 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
 impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> StorageTrieWriter for DatabaseProvider<TX, N> {
     /// Writes storage trie updates from the given storage trie map. First sorts the storage trie
     /// updates by the hashed address, writing in sorted order.
-    fn write_storage_trie_updates(
+    fn write_storage_trie_updates<'a>(
         &self,
-        storage_tries: &B256Map<StorageTrieUpdates>,
+        storage_tries: impl Iterator<Item = (&'a B256, &'a StorageTrieUpdates)>,
     ) -> ProviderResult<usize> {
         let mut num_entries = 0;
-        let mut storage_tries = Vec::from_iter(storage_tries);
+        let mut storage_tries = storage_tries.collect::<Vec<_>>();
         storage_tries.sort_unstable_by(|a, b| a.0.cmp(b.0));
         let mut cursor = self.tx_ref().cursor_dup_write::<tables::StoragesTrie>()?;
         for (hashed_address, storage_trie_updates) in storage_tries {
@@ -2368,20 +2358,6 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> StorageTrieWriter for DatabaseP
         }
 
         Ok(num_entries)
-    }
-
-    fn write_individual_storage_trie_updates(
-        &self,
-        hashed_address: B256,
-        updates: &StorageTrieUpdates,
-    ) -> ProviderResult<usize> {
-        if updates.is_empty() {
-            return Ok(0)
-        }
-
-        let cursor = self.tx_ref().cursor_dup_write::<tables::StoragesTrie>()?;
-        let mut trie_db_cursor = DatabaseStorageTrieCursor::new(cursor, hashed_address);
-        Ok(trie_db_cursor.write_storage_trie_updates(updates)?)
     }
 }
 
@@ -2531,82 +2507,6 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HashingWriter for DatabaseProvi
         })?;
 
         Ok(hashed_storage_keys)
-    }
-
-    fn insert_hashes(
-        &self,
-        range: RangeInclusive<BlockNumber>,
-        end_block_hash: B256,
-        expected_state_root: B256,
-    ) -> ProviderResult<()> {
-        // Initialize prefix sets.
-        let mut account_prefix_set = PrefixSetMut::default();
-        let mut storage_prefix_sets: HashMap<B256, PrefixSetMut> = HashMap::default();
-        let mut destroyed_accounts = HashSet::default();
-
-        let mut durations_recorder = metrics::DurationsRecorder::default();
-
-        // storage hashing stage
-        {
-            let lists = self.changed_storages_with_range(range.clone())?;
-            let storages = self.plain_state_storages(lists)?;
-            let storage_entries = self.insert_storage_for_hashing(storages)?;
-            for (hashed_address, hashed_slots) in storage_entries {
-                account_prefix_set.insert(Nibbles::unpack(hashed_address));
-                for slot in hashed_slots {
-                    storage_prefix_sets
-                        .entry(hashed_address)
-                        .or_default()
-                        .insert(Nibbles::unpack(slot));
-                }
-            }
-        }
-        durations_recorder.record_relative(metrics::Action::InsertStorageHashing);
-
-        // account hashing stage
-        {
-            let lists = self.changed_accounts_with_range(range.clone())?;
-            let accounts = self.basic_accounts(lists)?;
-            let hashed_addresses = self.insert_account_for_hashing(accounts)?;
-            for (hashed_address, account) in hashed_addresses {
-                account_prefix_set.insert(Nibbles::unpack(hashed_address));
-                if account.is_none() {
-                    destroyed_accounts.insert(hashed_address);
-                }
-            }
-        }
-        durations_recorder.record_relative(metrics::Action::InsertAccountHashing);
-
-        // merkle tree
-        {
-            // This is the same as `StateRoot::incremental_root_with_updates`, only the prefix sets
-            // are pre-loaded.
-            let prefix_sets = TriePrefixSets {
-                account_prefix_set: account_prefix_set.freeze(),
-                storage_prefix_sets: storage_prefix_sets
-                    .into_iter()
-                    .map(|(k, v)| (k, v.freeze()))
-                    .collect(),
-                destroyed_accounts,
-            };
-            let (state_root, trie_updates) = StateRoot::from_tx(&self.tx)
-                .with_prefix_sets(prefix_sets)
-                .root_with_updates()
-                .map_err(reth_db_api::DatabaseError::from)?;
-            if state_root != expected_state_root {
-                return Err(ProviderError::StateRootMismatch(Box::new(RootMismatch {
-                    root: GotExpected { got: state_root, expected: expected_state_root },
-                    block_number: *range.end(),
-                    block_hash: end_block_hash,
-                })))
-            }
-            self.write_trie_updates(&trie_updates)?;
-        }
-        durations_recorder.record_relative(metrics::Action::InsertMerkleTree);
-
-        debug!(target: "providers::db", ?range, actions = ?durations_recorder.actions, "Inserted hashes");
-
-        Ok(())
     }
 }
 
@@ -2960,13 +2860,6 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
                 // Increment transaction id for each transaction.
                 next_tx_num += 1;
             }
-
-            debug!(
-                target: "providers::db",
-                ?block_number,
-                actions = ?durations_recorder.actions,
-                "Inserted block body"
-            );
         }
 
         self.storage.writer().write_block_bodies(self, bodies, write_to)?;
@@ -3061,17 +2954,19 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
         blocks: Vec<RecoveredBlock<Self::Block>>,
         execution_outcome: &ExecutionOutcome<Self::Receipt>,
         hashed_state: HashedPostStateSorted,
-        trie_updates: TrieUpdates,
     ) -> ProviderResult<()> {
         if blocks.is_empty() {
             debug!(target: "providers::db", "Attempted to append empty block range");
             return Ok(())
         }
 
-        let first_number = blocks.first().unwrap().number();
+        // Blocks are not empty, so no need to handle the case of `blocks.first()` being
+        // `None`.
+        let first_number = blocks[0].number();
 
-        let last = blocks.last().unwrap();
-        let last_block_number = last.number();
+        // Blocks are not empty, so no need to handle the case of `blocks.last()` being
+        // `None`.
+        let last_block_number = blocks[blocks.len() - 1].number();
 
         let mut durations_recorder = metrics::DurationsRecorder::default();
 
@@ -3086,7 +2981,6 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
 
         // insert hashes and intermediate merkle nodes
         self.write_hashed_state(&hashed_state)?;
-        self.write_trie_updates(&trie_updates)?;
         durations_recorder.record_relative(metrics::Action::InsertHashes);
 
         self.update_history_indices(first_number..=last_block_number)?;
@@ -3199,5 +3093,259 @@ impl<TX: DbTx + 'static, N: NodeTypes + 'static> DBProvider for DatabaseProvider
 
     fn prune_modes_ref(&self) -> &PruneModes {
         self.prune_modes_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        test_utils::{blocks::BlockchainTestData, create_test_provider_factory},
+        BlockWriter,
+    };
+    use reth_testing_utils::generators::{self, random_block, BlockParams};
+
+    #[test]
+    fn test_receipts_by_block_range_empty_range() {
+        let factory = create_test_provider_factory();
+        let provider = factory.provider().unwrap();
+
+        // empty range should return empty vec
+        let start = 10u64;
+        let end = 9u64;
+        let result = provider.receipts_by_block_range(start..=end).unwrap();
+        assert_eq!(result, Vec::<Vec<reth_ethereum_primitives::Receipt>>::new());
+    }
+
+    #[test]
+    fn test_receipts_by_block_range_nonexistent_blocks() {
+        let factory = create_test_provider_factory();
+        let provider = factory.provider().unwrap();
+
+        // non-existent blocks should return empty vecs for each block
+        let result = provider.receipts_by_block_range(10..=12).unwrap();
+        assert_eq!(result, vec![vec![], vec![], vec![]]);
+    }
+
+    #[test]
+    fn test_receipts_by_block_range_single_block() {
+        let factory = create_test_provider_factory();
+        let data = BlockchainTestData::default();
+
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw
+            .insert_block(
+                data.genesis.clone().try_recover().unwrap(),
+                crate::StorageLocation::Database,
+            )
+            .unwrap();
+        provider_rw
+            .insert_block(data.blocks[0].0.clone(), crate::StorageLocation::Database)
+            .unwrap();
+        provider_rw
+            .write_state(
+                &data.blocks[0].1,
+                crate::OriginalValuesKnown::No,
+                crate::StorageLocation::Database,
+            )
+            .unwrap();
+        provider_rw.commit().unwrap();
+
+        let provider = factory.provider().unwrap();
+        let result = provider.receipts_by_block_range(1..=1).unwrap();
+
+        // should have one vec with one receipt
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        assert_eq!(result[0][0], data.blocks[0].1.receipts()[0][0]);
+    }
+
+    #[test]
+    fn test_receipts_by_block_range_multiple_blocks() {
+        let factory = create_test_provider_factory();
+        let data = BlockchainTestData::default();
+
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw
+            .insert_block(
+                data.genesis.clone().try_recover().unwrap(),
+                crate::StorageLocation::Database,
+            )
+            .unwrap();
+        for i in 0..3 {
+            provider_rw
+                .insert_block(data.blocks[i].0.clone(), crate::StorageLocation::Database)
+                .unwrap();
+            provider_rw
+                .write_state(
+                    &data.blocks[i].1,
+                    crate::OriginalValuesKnown::No,
+                    crate::StorageLocation::Database,
+                )
+                .unwrap();
+        }
+        provider_rw.commit().unwrap();
+
+        let provider = factory.provider().unwrap();
+        let result = provider.receipts_by_block_range(1..=3).unwrap();
+
+        // should have 3 vecs, each with one receipt
+        assert_eq!(result.len(), 3);
+        for (i, block_receipts) in result.iter().enumerate() {
+            assert_eq!(block_receipts.len(), 1);
+            assert_eq!(block_receipts[0], data.blocks[i].1.receipts()[0][0]);
+        }
+    }
+
+    #[test]
+    fn test_receipts_by_block_range_blocks_with_varying_tx_counts() {
+        let factory = create_test_provider_factory();
+        let data = BlockchainTestData::default();
+
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw
+            .insert_block(
+                data.genesis.clone().try_recover().unwrap(),
+                crate::StorageLocation::Database,
+            )
+            .unwrap();
+
+        // insert blocks 1-3 with receipts
+        for i in 0..3 {
+            provider_rw
+                .insert_block(data.blocks[i].0.clone(), crate::StorageLocation::Database)
+                .unwrap();
+            provider_rw
+                .write_state(
+                    &data.blocks[i].1,
+                    crate::OriginalValuesKnown::No,
+                    crate::StorageLocation::Database,
+                )
+                .unwrap();
+        }
+        provider_rw.commit().unwrap();
+
+        let provider = factory.provider().unwrap();
+        let result = provider.receipts_by_block_range(1..=3).unwrap();
+
+        // verify each block has one receipt
+        assert_eq!(result.len(), 3);
+        for block_receipts in &result {
+            assert_eq!(block_receipts.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_receipts_by_block_range_partial_range() {
+        let factory = create_test_provider_factory();
+        let data = BlockchainTestData::default();
+
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw
+            .insert_block(
+                data.genesis.clone().try_recover().unwrap(),
+                crate::StorageLocation::Database,
+            )
+            .unwrap();
+        for i in 0..3 {
+            provider_rw
+                .insert_block(data.blocks[i].0.clone(), crate::StorageLocation::Database)
+                .unwrap();
+            provider_rw
+                .write_state(
+                    &data.blocks[i].1,
+                    crate::OriginalValuesKnown::No,
+                    crate::StorageLocation::Database,
+                )
+                .unwrap();
+        }
+        provider_rw.commit().unwrap();
+
+        let provider = factory.provider().unwrap();
+
+        // request range that includes both existing and non-existing blocks
+        let result = provider.receipts_by_block_range(2..=5).unwrap();
+        assert_eq!(result.len(), 4);
+
+        // blocks 2-3 should have receipts, blocks 4-5 should be empty
+        assert_eq!(result[0].len(), 1); // block 2
+        assert_eq!(result[1].len(), 1); // block 3
+        assert_eq!(result[2].len(), 0); // block 4 (doesn't exist)
+        assert_eq!(result[3].len(), 0); // block 5 (doesn't exist)
+
+        assert_eq!(result[0][0], data.blocks[1].1.receipts()[0][0]);
+        assert_eq!(result[1][0], data.blocks[2].1.receipts()[0][0]);
+    }
+
+    #[test]
+    fn test_receipts_by_block_range_all_empty_blocks() {
+        let factory = create_test_provider_factory();
+        let mut rng = generators::rng();
+
+        // create blocks with no transactions
+        let mut blocks = Vec::new();
+        for i in 1..=3 {
+            let block =
+                random_block(&mut rng, i, BlockParams { tx_count: Some(0), ..Default::default() });
+            blocks.push(block);
+        }
+
+        let provider_rw = factory.provider_rw().unwrap();
+        for block in blocks {
+            provider_rw
+                .insert_block(block.try_recover().unwrap(), crate::StorageLocation::Database)
+                .unwrap();
+        }
+        provider_rw.commit().unwrap();
+
+        let provider = factory.provider().unwrap();
+        let result = provider.receipts_by_block_range(1..=3).unwrap();
+
+        assert_eq!(result.len(), 3);
+        for block_receipts in result {
+            assert_eq!(block_receipts.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_receipts_by_block_range_consistency_with_individual_calls() {
+        let factory = create_test_provider_factory();
+        let data = BlockchainTestData::default();
+
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw
+            .insert_block(
+                data.genesis.clone().try_recover().unwrap(),
+                crate::StorageLocation::Database,
+            )
+            .unwrap();
+        for i in 0..3 {
+            provider_rw
+                .insert_block(data.blocks[i].0.clone(), crate::StorageLocation::Database)
+                .unwrap();
+            provider_rw
+                .write_state(
+                    &data.blocks[i].1,
+                    crate::OriginalValuesKnown::No,
+                    crate::StorageLocation::Database,
+                )
+                .unwrap();
+        }
+        provider_rw.commit().unwrap();
+
+        let provider = factory.provider().unwrap();
+
+        // get receipts using block range method
+        let range_result = provider.receipts_by_block_range(1..=3).unwrap();
+
+        // get receipts using individual block calls
+        let mut individual_results = Vec::new();
+        for block_num in 1..=3 {
+            let receipts =
+                provider.receipts_by_block(block_num.into()).unwrap().unwrap_or_default();
+            individual_results.push(receipts);
+        }
+
+        assert_eq!(range_result, individual_results);
     }
 }

@@ -1,11 +1,11 @@
 use crate::{BlockNumReader, DatabaseProviderFactory, HeaderProvider};
 use alloy_primitives::B256;
 use reth_errors::ProviderError;
-use reth_storage_api::{DBProvider, StateCommitmentProvider};
 pub use reth_storage_errors::provider::ConsistentViewError;
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::HashedPostState;
-use reth_trie_db::{DatabaseHashedPostState, StateCommitment};
+use reth_trie_db::DatabaseHashedPostState;
+use reth_storage_api::DBProvider;
 
 /// A consistent view over state in the database.
 ///
@@ -31,8 +31,7 @@ pub struct ConsistentDbView<Factory> {
 
 impl<Factory> ConsistentDbView<Factory>
 where
-    Factory: DatabaseProviderFactory<Provider: BlockNumReader + HeaderProvider>
-        + StateCommitmentProvider,
+    Factory: DatabaseProviderFactory<Provider: BlockNumReader + HeaderProvider>,
 {
     /// Creates new consistent database view.
     pub const fn new(factory: Factory, tip: Option<(B256, u64)>) -> Self {
@@ -47,28 +46,31 @@ where
         Ok(Self::new(provider, tip))
     }
 
-    /// Creates new consistent database view with NO CHECKS.
-    /// This is essentially a Non-Consistent View.
-    pub fn new_unchecked(provider: Factory) -> ProviderResult<Self> {
-        Ok(Self { factory: provider, tip: None, ignore_tip_check: true })
-    }
+    // /// Creates new consistent database view with NO CHECKS.
+    // /// This is essentially a Non-Consistent View.
+    // pub fn new_unchecked(_provider: Factory) -> ProviderResult<Self> {
+    //     panic!("removed code in reth");
+    //     // Ok(Self { factory: provider, tip: None, ignore_tip_check: true })
+    // }
 
-    /// Retrieve revert hashed state down to the given block hash.
-    pub fn revert_state(&self, block_hash: B256) -> ProviderResult<HashedPostState> {
-        let provider = self.provider_ro()?;
-        let block_number = provider
-            .block_number(block_hash)?
-            .ok_or(ProviderError::BlockHashNotFound(block_hash))?;
-        if block_number == provider.best_block_number()? &&
-            block_number == provider.last_block_number()?
-        {
-            Ok(HashedPostState::default())
-        } else {
-            Ok(HashedPostState::from_reverts::<
-                <Factory::StateCommitment as StateCommitment>::KeyHasher,
-            >(provider.tx_ref(), block_number + 1)?)
-        }
-    }
+    // /// Retrieve revert hashed state down to the given block hash.
+    // pub fn revert_state(&self, _block_hash: B256) -> ProviderResult<HashedPostState> {
+    //     panic!("removed code in reth");
+    //     // let provider = self.provider_ro()?;
+    //     // let block_number = provider
+    //     //     .block_number(block_hash)?
+    //     //     .ok_or(ProviderError::BlockHashNotFound(block_hash))?;
+    //     // if block_number == provider.best_block_number()? &&
+    //     //     block_number == provider.last_block_number()?
+    //     // {
+    //     //     Ok(HashedPostState::default())
+    //     // } else {
+    //     //     Ok(HashedPostState::from_reverts::<
+    //     //         <Factory::StateCommitment as StateCommitment>::KeyHasher,
+    //     //     >(provider.tx_ref(), block_number + 1)?)
+    //     //     // Ok(HashedPostState::default())
+    //     // }
+    // }
 
     /// Creates new read-only provider and performs consistency checks on the current tip.
     pub fn provider_ro(&self) -> ProviderResult<Factory::Provider> {
@@ -111,10 +113,10 @@ where
         //
         // To ensure this doesn't happen, we just have to make sure that we fetch from the same
         // data source that we used during initialization. In this case, that is static files
-        if let Some((hash, number)) = self.tip {
-            if provider_ro.sealed_header(number)?.is_none_or(|header| header.hash() != hash) {
-                return Err(ConsistentViewError::Reorged { block: hash }.into())
-            }
+        if let Some((hash, number)) = self.tip &&
+            provider_ro.sealed_header(number)?.is_none_or(|header| header.hash() != hash)
+        {
+            return Err(ConsistentViewError::Reorged { block: hash }.into())
         }
 
         Ok(provider_ro)

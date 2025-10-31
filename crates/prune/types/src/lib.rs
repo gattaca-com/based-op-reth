@@ -30,7 +30,7 @@ pub use pruner::{
     SegmentOutputCheckpoint,
 };
 pub use segment::{PrunePurpose, PruneSegment, PruneSegmentError};
-pub use target::{PruneModes, MINIMUM_PRUNING_DISTANCE};
+pub use target::{PruneModes, UnwindTargetPrunedError, MINIMUM_PRUNING_DISTANCE};
 
 /// Configuration for pruning receipts not associated with logs emitted by the specified contracts.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -96,12 +96,11 @@ impl ReceiptsLogPruneConfig {
         let mut lowest = None;
 
         for mode in self.values() {
-            if mode.is_distance() {
-                if let Some((block, _)) =
+            if mode.is_distance() &&
+                let Some((block, _)) =
                     mode.prune_target_block(tip, PruneSegment::ContractLogs, PrunePurpose::User)?
-                {
-                    lowest = Some(lowest.unwrap_or(u64::MAX).min(block));
-                }
+            {
+                lowest = Some(lowest.unwrap_or(u64::MAX).min(block));
             }
         }
 

@@ -90,7 +90,9 @@ pub fn get_fields(data: &Data) -> FieldList {
 
                 match &variant.fields {
                     syn::Fields::Named(_) => {
-                        panic!("Not allowed to have Enum Variants with multiple named fields. Make it a struct instead.")
+                        panic!(
+                            "Not allowed to have Enum Variants with multiple named fields. Make it a struct instead."
+                        )
                     }
                     syn::Fields::Unnamed(data_fields) => {
                         assert_eq!(
@@ -169,28 +171,14 @@ fn load_field_from_segments(
 ///
 /// If so, we use another impl to code/decode its data.
 fn should_use_alt_impl(ftype: &str, segment: &syn::PathSegment) -> bool {
-    if ftype == "Vec" || ftype == "Option" {
-        if let syn::PathArguments::AngleBracketed(ref args) = segment.arguments {
-            if let Some(syn::GenericArgument::Type(syn::Type::Path(arg_path))) = args.args.last() {
-                if let (Some(path), 1) =
-                    (arg_path.path.segments.first(), arg_path.path.segments.len())
-                {
-                    if [
-                        "B256",
-                        "Address",
-                        "Address",
-                        "Bloom",
-                        "TxHash",
-                        "BlockHash",
-                        "CompactPlaceholder",
-                    ]
-                    .contains(&path.ident.to_string().as_str())
-                    {
-                        return true
-                    }
-                }
-            }
-        }
+    if (ftype == "Vec" || ftype == "Option") &&
+        let syn::PathArguments::AngleBracketed(ref args) = segment.arguments &&
+        let Some(syn::GenericArgument::Type(syn::Type::Path(arg_path))) = args.args.last() &&
+        let (Some(path), 1) = (arg_path.path.segments.first(), arg_path.path.segments.len()) &&
+        ["B256", "Address", "Address", "Bloom", "TxHash", "BlockHash", "CompactPlaceholder"]
+            .contains(&path.ident.to_string().as_str())
+    {
+        return true
     }
     false
 }
@@ -221,7 +209,7 @@ mod tests {
     use syn::parse2;
 
     #[test]
-    fn gen() {
+    fn compact_codec() {
         let f_struct = quote! {
              #[derive(Debug, PartialEq, Clone)]
              pub struct TestStruct {
