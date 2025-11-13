@@ -56,7 +56,7 @@ pub mod error;
 mod instrumented_state;
 mod invalid_headers;
 mod metrics;
-mod payload_processor;
+pub mod payload_processor;
 pub mod payload_validator;
 mod persistence_state;
 pub mod precompile_cache;
