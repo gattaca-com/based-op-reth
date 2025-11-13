@@ -58,7 +58,7 @@ impl SparseTrieUpdate {
 
 /// Common configuration for multi proof tasks
 #[derive(Debug, Clone, Default)]
-pub(crate) struct MultiProofConfig {
+pub struct MultiProofConfig {
     /// The sorted collection of cached in-memory intermediate trie nodes that
     /// can be reused for computation.
     pub nodes_sorted: Arc<TrieUpdatesSorted>,
