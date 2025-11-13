@@ -75,7 +75,7 @@ impl MultiProofConfig {
     ///
     /// This returns a cleared [`TrieInput`] so that we can reuse any allocated space in the
     /// [`TrieInput`].
-    pub(crate) fn from_input(mut input: TrieInput) -> (TrieInput, Self) {
+    pub fn from_input(mut input: TrieInput) -> (TrieInput, Self) {
         let config = Self {
             nodes_sorted: Arc::new(input.nodes.drain_into_sorted()),
             state_sorted: Arc::new(input.state.drain_into_sorted()),
