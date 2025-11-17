@@ -58,7 +58,7 @@ impl SparseTrieUpdate {
 
 /// Common configuration for multi proof tasks
 #[derive(Debug, Clone, Default)]
-pub(crate) struct MultiProofConfig {
+pub struct MultiProofConfig {
     /// The sorted collection of cached in-memory intermediate trie nodes that
     /// can be reused for computation.
     pub nodes_sorted: Arc<TrieUpdatesSorted>,
@@ -75,7 +75,7 @@ impl MultiProofConfig {
     ///
     /// This returns a cleared [`TrieInput`] so that we can reuse any allocated space in the
     /// [`TrieInput`].
-    pub(crate) fn from_input(mut input: TrieInput) -> (TrieInput, Self) {
+    pub fn from_input(mut input: TrieInput) -> (TrieInput, Self) {
         let config = Self {
             nodes_sorted: Arc::new(input.nodes.drain_into_sorted()),
             state_sorted: Arc::new(input.state.drain_into_sorted()),
